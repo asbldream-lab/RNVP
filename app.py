@@ -1,8 +1,10 @@
 """
-YouTube Transcript Extractor v2
+YouTube Transcript Extractor v3
 --------------------------------
-Colle l'URL d'une chaîne (ou d'une playlist), choisis le nombre de vidéos,
-le script récupère les transcriptions et te génère un .docx.
+- yt-dlp uniquement (plus robuste que youtube-transcript-api)
+- Liste les sous-titres dispo, construit une liste ordonnée de cibles
+- Itère sur les cibles jusqu'à ce qu'une marche (fr manuel → fr auto → en manuel → en auto → fallback)
+- User-Agent navigateur + retries pour contourner le rate-limiting YouTube
 """
 
 import os
@@ -14,30 +16,27 @@ from io import BytesIO
 
 import streamlit as st
 import yt_dlp
-from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound
 from docx import Document
 from docx.shared import Pt, RGBColor
 
 
 # ============================================================================
-# CONFIG STREAMLIT
+# CONFIG
 # ============================================================================
-st.set_page_config(
-    page_title="YouTube Transcript Extractor",
-    page_icon="🎬",
-    layout="wide",
-)
-
+st.set_page_config(page_title="YouTube Transcript Extractor", page_icon="🎬", layout="wide")
 st.title("🎬 YouTube Transcript Extractor")
 st.caption("Colle une URL de chaîne / playlist → récupère les N dernières transcriptions → télécharge un .docx")
 
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+)
+
 
 # ============================================================================
-# HELPERS - LISTING
+# LISTING VIDÉOS
 # ============================================================================
 def normalize_channel_url(url: str) -> str:
-    """Force le suffixe /videos pour récupérer les uploads récents d'une chaîne."""
     url = url.strip().rstrip("/")
     if "playlist" in url or "watch?v=" in url or "/videos" in url:
         return url
@@ -45,13 +44,14 @@ def normalize_channel_url(url: str) -> str:
 
 
 def list_videos(url: str, n: int):
-    """Liste les N dernières vidéos d'une chaîne ou playlist via yt-dlp."""
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
         "extract_flat": True,
         "playlistend": n,
         "skip_download": True,
+        "http_headers": {"User-Agent": USER_AGENT},
+        "retries": 3,
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -67,30 +67,26 @@ def list_videos(url: str, n: int):
             "title": e.get("title", "Sans titre"),
             "url": e.get("url") or f"https://www.youtube.com/watch?v={vid_id}",
         })
-    source_title = info.get("title") or "YouTube Transcripts"
-    return videos, source_title
+    return videos, info.get("title") or "YouTube Transcripts"
 
 
 # ============================================================================
-# HELPERS - LANG MATCHING
+# MATCHING DE LANGUE
 # ============================================================================
-def match_lang(pref: str, pool: list):
-    """
-    Matche 'fr' avec 'fr', 'fr-FR', 'fr-CA'.
-    Matche 'en' avec 'en', 'en-US', 'en-GB', 'en-orig'.
-    Retourne le code exact présent dans le pool, ou None.
-    """
+def match_lang(pref: str, pool):
+    """'fr' matche 'fr', 'fr-FR', 'fr-CA'. 'en' matche 'en', 'en-US', 'en-orig'."""
     pref_lower = pref.lower()
-    # 1. Match exact
+    pool = list(pool)
+    # 1. Exact
     for lang in pool:
         if lang.lower() == pref_lower:
             return lang
-    # 2. Match par préfixe avec tiret/underscore (fr-FR, en-US...)
+    # 2. Préfixe avec tiret/underscore
     for lang in pool:
-        lang_low = lang.lower()
-        if lang_low.startswith(pref_lower + "-") or lang_low.startswith(pref_lower + "_"):
+        ll = lang.lower()
+        if ll.startswith(pref_lower + "-") or ll.startswith(pref_lower + "_"):
             return lang
-    # 3. Match loose (base du code de langue)
+    # 3. Base du code
     for lang in pool:
         base = lang.lower().split("-")[0].split("_")[0]
         if base == pref_lower:
@@ -99,10 +95,9 @@ def match_lang(pref: str, pool: list):
 
 
 # ============================================================================
-# HELPERS - VTT PARSING
+# PARSING VTT
 # ============================================================================
 def parse_vtt(path: str) -> str:
-    """Extrait le texte propre d'un fichier .vtt (sans timestamps ni balises)."""
     try:
         with open(path, "r", encoding="utf-8") as f:
             content = f.read()
@@ -120,34 +115,109 @@ def parse_vtt(path: str) -> str:
             continue
         if re.match(r"^\d+$", line):
             continue
-        # Retirer balises <c>, <00:00:00.000>, <v Speaker>, etc.
         line = re.sub(r"<[^>]+>", "", line)
-        # Décoder &amp;, &#39;, etc.
-        line = html.unescape(line)
-        line = line.strip()
+        line = html.unescape(line).strip()
         if line and (not lines or lines[-1] != line):
             lines.append(line)
     return " ".join(lines)
 
 
 # ============================================================================
-# FETCH - MÉTHODE 1 : yt-dlp (primaire, plus fiable)
+# FETCH — listing préalable + loop de cibles avec fallback
 # ============================================================================
-def fetch_transcript_ytdlp(video_id: str, lang_pref: list, include_auto: bool):
-    """
-    1. Liste les sous-titres disponibles via extract_info
-    2. Détermine la meilleure langue cible
-    3. Télécharge UNIQUEMENT cette langue en .vtt
-    Retourne (texte, label_langue, message_erreur).
-    """
+def build_targets(manual_subs, auto_subs, lang_pref, include_auto):
+    """Construit la liste ordonnée (lang, type) des cibles à essayer."""
+    targets = []
+    seen = set()
+
+    def add(lang, t):
+        key = (lang.lower(), t)
+        if key not in seen:
+            seen.add(key)
+            targets.append((lang, t))
+
+    # 1. Manuels dans langues préférées
+    for pref in lang_pref:
+        m = match_lang(pref, manual_subs)
+        if m:
+            add(m, "manuel")
+
+    # 2. Auto dans langues préférées
+    if include_auto:
+        for pref in lang_pref:
+            m = match_lang(pref, auto_subs)
+            if m:
+                add(m, "auto")
+
+    # 3. Anglais en fallback (manuel)
+    for lang in manual_subs:
+        if lang.lower().startswith("en"):
+            add(lang, "manuel")
+
+    # 4. Anglais en fallback (auto)
+    if include_auto:
+        for lang in auto_subs:
+            if lang.lower().startswith("en"):
+                add(lang, "auto")
+
+    # 5. Premier manuel dispo (langue originale quelle qu'elle soit)
+    for lang in sorted(manual_subs):
+        add(lang, "manuel")
+
+    # 6. Premier auto dispo
+    if include_auto:
+        for lang in sorted(auto_subs):
+            add(lang, "auto")
+
+    return targets
+
+
+def try_download_one(video_url, target_lang, target_type, tmp):
+    """Tente de télécharger UNE cible. Retourne le chemin du .vtt ou None."""
+    dl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "writesubtitles": (target_type == "manuel"),
+        "writeautomaticsub": (target_type == "auto"),
+        "subtitleslangs": [target_lang],
+        "subtitlesformat": "vtt",
+        "outtmpl": os.path.join(tmp, "%(id)s.%(ext)s"),
+        "http_headers": {"User-Agent": USER_AGENT},
+        "retries": 3,
+        "extractor_retries": 3,
+    }
+    try:
+        with yt_dlp.YoutubeDL(dl_opts) as ydl:
+            ydl.download([video_url])
+    except Exception as e:
+        return None, type(e).__name__
+
+    vtt_files = glob.glob(os.path.join(tmp, "*.vtt"))
+    if not vtt_files:
+        return None, "no-vtt-file"
+    # Prendre le plus récent
+    vtt_files.sort(key=os.path.getmtime, reverse=True)
+    return vtt_files[0], None
+
+
+def fetch_transcript(video_id: str, lang_pref: list, include_auto: bool):
+    """Retourne (texte, label_langue, message_erreur)."""
     video_url = f"https://www.youtube.com/watch?v={video_id}"
 
-    # Étape 1 : inventaire des sous-titres dispos
+    # 1. Inventaire des sous-titres
     try:
-        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "skip_download": True}) as ydl:
+        with yt_dlp.YoutubeDL({
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "http_headers": {"User-Agent": USER_AGENT},
+            "retries": 3,
+            "extractor_retries": 3,
+        }) as ydl:
             info = ydl.extract_info(video_url, download=False)
     except Exception as e:
-        return None, None, f"yt-dlp extract_info : {type(e).__name__}"
+        return None, None, f"extract_info : {type(e).__name__}"
 
     manual_subs = list((info.get("subtitles") or {}).keys())
     auto_subs = list((info.get("automatic_captions") or {}).keys())
@@ -155,136 +225,29 @@ def fetch_transcript_ytdlp(video_id: str, lang_pref: list, include_auto: bool):
     if not manual_subs and not auto_subs:
         return None, None, "aucun sous-titre (ni manuel ni auto)"
 
-    # Étape 2 : choisir la meilleure langue
-    target_lang, target_type = None, None
+    # 2. Construire la liste des cibles
+    targets = build_targets(manual_subs, auto_subs, lang_pref, include_auto)
+    if not targets:
+        return None, None, "aucune cible compatible"
 
-    # Priorité 1 : manuels dans langues préférées
-    for lang in lang_pref:
-        m = match_lang(lang, manual_subs)
-        if m:
-            target_lang, target_type = m, "manuel"
-            break
-
-    # Priorité 2 : auto dans langues préférées
-    if not target_lang and include_auto:
-        for lang in lang_pref:
-            m = match_lang(lang, auto_subs)
-            if m:
-                target_lang, target_type = m, "auto"
-                break
-
-    # Priorité 3 : n'importe quel manuel (favoriser en si présent)
-    if not target_lang and manual_subs:
-        target_lang = next((l for l in manual_subs if l.lower().startswith("en")), manual_subs[0])
-        target_type = "manuel"
-
-    # Priorité 4 : n'importe quel auto
-    if not target_lang and include_auto and auto_subs:
-        target_lang = next((l for l in auto_subs if l.lower().startswith("en")), auto_subs[0])
-        target_type = "auto"
-
-    if not target_lang:
-        return None, None, "sous-titres auto désactivés par l'utilisateur"
-
-    # Étape 3 : télécharger uniquement cette langue
-    with tempfile.TemporaryDirectory() as tmp:
-        dl_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "skip_download": True,
-            "writesubtitles": target_type == "manuel",
-            "writeautomaticsub": target_type == "auto",
-            "subtitleslangs": [target_lang],
-            "subtitlesformat": "vtt",
-            "outtmpl": os.path.join(tmp, "%(id)s.%(ext)s"),
-        }
-        try:
-            with yt_dlp.YoutubeDL(dl_opts) as ydl:
-                ydl.download([video_url])
-        except Exception as e:
-            return None, None, f"yt-dlp download : {type(e).__name__}"
-
-        vtt_files = glob.glob(os.path.join(tmp, "*.vtt"))
-        if not vtt_files:
-            return None, None, f"fichier .vtt non créé pour la langue {target_lang}"
-
-        text = parse_vtt(vtt_files[0])
-        if not text:
-            return None, None, "fichier .vtt vide après parsing"
-
-        return text, f"{target_lang} ({target_type})", None
-
-
-# ============================================================================
-# FETCH - MÉTHODE 2 : youtube-transcript-api (fallback)
-# ============================================================================
-def fetch_transcript_api(video_id: str, lang_pref: list, include_auto: bool):
-    """Fallback secondaire si yt-dlp n'a rien donné."""
-    try:
-        transcripts = YouTubeTranscriptApi.list_transcripts(video_id)
-    except (TranscriptsDisabled, NoTranscriptFound):
-        return None, None, "API : transcripts désactivés"
-    except Exception as e:
-        return None, None, f"API list : {type(e).__name__}"
-
-    # Manuels en langue préférée
-    for lang in lang_pref:
-        try:
-            t = transcripts.find_manually_created_transcript([lang])
-            return " ".join(x["text"] for x in t.fetch()), f"{lang} (manuel-API)", None
-        except Exception:
-            continue
-
-    # Auto en langue préférée
-    if include_auto:
-        for lang in lang_pref:
-            try:
-                t = transcripts.find_generated_transcript([lang])
-                return " ".join(x["text"] for x in t.fetch()), f"{lang} (auto-API)", None
-            except Exception:
-                continue
-
-    # Dernier recours : n'importe quoi de dispo
-    try:
-        for t in transcripts:
-            if t.is_generated and not include_auto:
-                continue
-            try:
-                text = " ".join(x["text"] for x in t.fetch())
-                tag = "auto-API" if t.is_generated else "manuel-API"
-                return text, f"{t.language_code} ({tag})", None
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    return None, None, "API : aucun transcript récupérable"
-
-
-# ============================================================================
-# FETCH - ORCHESTRATEUR
-# ============================================================================
-def get_transcript(video_id: str, lang_pref: list, include_auto: bool):
-    """Tente yt-dlp, puis API en fallback. Retourne (texte, langue, erreurs)."""
+    # 3. Itérer jusqu'à succès
     errors = []
+    for target_lang, target_type in targets:
+        with tempfile.TemporaryDirectory() as tmp:
+            vtt_path, err = try_download_one(video_url, target_lang, target_type, tmp)
+            if err:
+                errors.append(f"{target_lang}/{target_type}:{err}")
+                continue
+            text = parse_vtt(vtt_path)
+            if text:
+                return text, f"{target_lang} ({target_type})", None
+            errors.append(f"{target_lang}/{target_type}:vtt-vide")
 
-    text, lang, err = fetch_transcript_ytdlp(video_id, lang_pref, include_auto)
-    if text:
-        return text, lang, None
-    if err:
-        errors.append(f"yt-dlp → {err}")
-
-    text, lang, err = fetch_transcript_api(video_id, lang_pref, include_auto)
-    if text:
-        return text, lang, None
-    if err:
-        errors.append(f"API → {err}")
-
-    return None, None, " | ".join(errors) if errors else "raison inconnue"
+    return None, None, f"échec sur {len(targets)} cibles [{'; '.join(errors[:3])}]"
 
 
 # ============================================================================
-# BUILD DOCX
+# DOCX
 # ============================================================================
 def build_docx(source_title: str, channel_url: str, results: list) -> BytesIO:
     doc = Document()
@@ -299,7 +262,6 @@ def build_docx(source_title: str, channel_url: str, results: list) -> BytesIO:
 
     for idx, r in enumerate(results, 1):
         doc.add_heading(f"{idx}. {r['title']}", level=1)
-
         p = doc.add_paragraph()
         p.add_run("URL : ").bold = True
         p.add_run(r["url"])
@@ -313,7 +275,6 @@ def build_docx(source_title: str, channel_url: str, results: list) -> BytesIO:
             p = doc.add_paragraph()
             run = p.add_run(f"❌ Pas de transcription — {r.get('error', 'raison inconnue')}")
             run.font.color.rgb = RGBColor(0xC0, 0x00, 0x00)
-
         doc.add_paragraph("")
 
     buf = BytesIO()
@@ -380,7 +341,7 @@ if st.button("🚀 Extraire les transcriptions", type="primary", use_container_w
 
     for i, v in enumerate(videos):
         status.info(f"📝 Transcription {i+1}/{len(videos)} — {v['title']}")
-        text, lang, error = get_transcript(v["id"], lang_pref, include_auto)
+        text, lang, error = fetch_transcript(v["id"], lang_pref, include_auto)
         results.append({
             "id": v["id"],
             "title": v["title"],
@@ -415,7 +376,7 @@ if st.button("🚀 Extraire les transcriptions", type="primary", use_container_w
         use_container_width=True,
     )
 
-    # 5. Détails des échecs (affichés direct, pas cachés)
+    # 5. Détails des échecs
     failures = [r for r in results if not r["transcript"]]
     if failures:
         with st.expander(f"⚠️ Détails des {len(failures)} échec(s)", expanded=True):
